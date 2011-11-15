@@ -151,8 +151,7 @@ sub onlocal {
     my $self = shift;
     my ( $opt, $check ) = @_;
     $opt =~ s/AST/\\\*/g;
-    my @com = split /\s+/, $opt;
-    unshift @com, 'sh', '-c';
+    my @com = ('sh', '-c', $opt);
     $check->( system(@com) );
 }
 
