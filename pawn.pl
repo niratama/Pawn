@@ -108,6 +108,9 @@ sub exec {
                 if ( $com eq 'scp' ) {
                     $self->scp( $host, $opt, $check );
                 }
+                elsif ( $com eq 'rsync' ) {
+                    $self->rsync( $host, $opt, $check );
+                }
                 elsif ( $com eq 'local' ) {
                     $self->onlocal( $opt, $check );
                 }
@@ -144,6 +147,16 @@ sub scp {
     $opt =~ s/AST/\\\*/g;
     my @com = split /\s+/, $opt;
     unshift @com, 'scp', '-q';
+    $check->( system(@com) );
+}
+
+sub rsync {
+    my $self = shift;
+    my ( $host, $opt, $check ) = @_;
+    $opt =~ s/HOST/$host/g;
+    $opt =~ s/AST/\\\*/g;
+    my @com = split /\s+/, $opt;
+    unshift @com, 'rsync', '-q';
     $check->( system(@com) );
 }
 
