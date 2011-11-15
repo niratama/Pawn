@@ -1,8 +1,16 @@
 #!/usr/bin/env perl
 package App::Pawn::script;
+use 5.010;
 use Getopt::Long;
 use Term::ReadLine;
 use strict;
+
+use Net::OpenSSH;
+use Capture::Tiny qw(tee_merged);
+use Time::Piece;
+use Parallel::ForkManager;
+
+$Capture::Tiny::TIMEOUT = 0;
 
 sub new {
     my $class = shift;
@@ -19,8 +27,9 @@ sub parse_options {
 
     Getopt::Long::Configure("bundling");
     Getopt::Long::GetOptions(
-        's|shell' => \$self->{shell},
-        'h|help'  => sub { $self->help; exit },
+        'v|verbose' => \$self->{verbose},
+        's|shell'   => \$self->{shell},
+        'h|help'    => sub { $self->help; exit },
     );
     $self->{argv} = \@ARGV;
 }
@@ -39,24 +48,54 @@ HELP
 sub load_file {
     my $self   = shift;
     my $file   = shift @{ $self->{argv} };
-    my @attr   = qw( hosts commands );
     my $config = { file => $file };
 
-    my $dsl = join "\n",
-      map "sub $_ {my \$e=shift || return \$config->{$_}; \$config->{$_}=\$e }",
-      @attr;
-    $dsl .= <<DSL;
+    my $dsl = <<'DSL';
+sub lx    { $self->local_exec(@_) };
+sub lxr   { $self->local_exec_result(@_) };
+sub sh    { $self->sh(@_) };
+sub shr   { $self->sh_result(@_) };
+sub rx    { $self->remote_exec($config->{host}, @_) };
+sub rxr   { $self->remote_exec_result($config->{host}, @_) };
+sub scp   { $self->scp($config->{host}, @_) };
+sub rsync { $self->rsync($config->{host}, @_) };
+
+sub logdir { my $e = shift || return $config->{logdir}; $config->{logdir} = $e }
+
+sub hosts {
+    my $g = shift || return $config->{hosts};
+    return $config->{hosts}->{$g} unless @_;
+    for my $host (@_) {
+        if (ref($host) eq 'ARRAY') {
+            my $fmt = shift @$host;
+            push @{$config->{hosts}->{$g}}, map { sprintf($fmt, $_) } @$host;
+        } else {
+            push @{$config->{hosts}->{$g}}, $host;
+        }
+    }
+}
+
+sub commands {
+    my $g = shift || return $config->{commands};
+    my $c = shift || return $config->{commands}->{$g};
+    if (ref($c) eq 'CODE') {
+        $config->{commands}->{$g} = $c;
+    } elsif (ref($config->{commands}->{$g}) eq 'CODE') {
+        $config->{host} = $c;
+        return $config->{commands}->{$g}->($config->{host}, @_);
+    }
+}
 
 sub include {
-    my \$b = shift || return;
-    my \$f = dirname(\$file) . '/' . \$b;
-    unless ( do \$f ) { die "can't include \$f\\n" }
+    my $b = shift || return;
+    my $f = dirname($file) . '/' . $b;
+    unless ( do $f ) { die "can't include $f" }
 }
 DSL
 
     my $code = do { open my $io, "<", $file; local $/; <$io> };
     eval "package App::Pawn::Rule;\n"
-      . "use File::Basename;\nuse strict;\nuse utf8;\n$dsl\n$code";
+      . "use 5.010;use File::Basename;\nuse strict;\nuse utf8;\n$dsl\n$code";
     die $@ if ($@);
 }
 
@@ -72,100 +111,150 @@ sub loop {
 
 sub shell {
     my $self  = shift;
-    my @hosts = split /\s+/, App::Pawn::Rule::hosts();
+
+    my $g = $self->{argv}->[0];
+    say "shell:${g}" if $g;
+    my $groups = App::Pawn::Rule::hosts();
     my $term  = Term::ReadLine->new('Pawn');
     my $out   = $term->OUT || \*STDOUT;
     while ( defined( my $line = $term->readline('Pawn> ') ) ) {
         next if $line =~ /^\s*$/;
-        for my $host (@hosts) {
-            next unless ($host);
-            my $fd;
-            open $fd, '-|', "ssh -t $host $line 2> /dev/null";
-            my $output;
-            {
-                local $/ = undef;
-                $output = <$fd>;
+        for my $group (keys %$groups) {
+            next if ($group eq '_init') || ($group eq '_final');
+            next if defined($g) && ($group ne $g);
+            for my $host (@{$groups->{$group}}) {
+                next unless ($host);
+                my $fd;
+                open $fd, '-|', "ssh -t $host $line 2> /dev/null";
+                my $output;
+                {
+                    local $/ = undef;
+                    $output = <$fd>;
+                }
+                chomp($output);
+                close $fd;
+                printf $out "%s> %s\n", $host, $output;
             }
-            chomp($output);
-            close $fd;
-            printf $out "%s> %s\n", $host, $output;
         }
     }
+}
+
+sub log {
+    my $self = shift;
+    my $time = shift;
+    my $group = shift;
+    my $host = shift;
+    my $log = shift;
+
+    my $logdir = App::Pawn::Rule::logdir() // '.';
+    $logdir .= '/' . $time->datetime(date => '', T => '-', time => '');
+    mkdir $logdir, 0755;
+    open my $fd, '>', "${logdir}/${group}-${host}.log";
+    print $fd $log;
+    close $fd;
 }
 
 sub exec {
     my $self = shift;
-    my @hosts = split /\s+/, App::Pawn::Rule::hosts();
-    my %ret;
-    for my $host (@hosts) {
-        next unless ($host);
-        my @doChecks = App::Pawn::Rule::commands()->();
-        for my $doCheck (@doChecks) {
-            my $do    = $$doCheck[0];
-            my $check = $$doCheck[1];
-            if ( ref($do) eq "CODE" ) {
-                my ( $com, $opt ) = $do->();
-                if ( $com eq 'scp' ) {
-                    $self->scp( $host, $opt, $check );
-                }
-                elsif ( $com eq 'rsync' ) {
-                    $self->rsync( $host, $opt, $check );
-                }
-                elsif ( $com eq 'local' ) {
-                    $self->onlocal( $opt, $check );
-                }
-                else {
-                    die "Unkown command are found.\n";
-                }
-            }
-            else {
-                $self->ssh( $host, $do, $check );
-            }
+    my $now = localtime;
+    my $pm = Parallel::ForkManager->new(10);
+
+    my $groups = App::Pawn::Rule::hosts();
+    $self->log($now, '_init', 'localhost', tee_merged {
+        App::Pawn::Rule::commands('_init', 'localhost', @{$self->{argv}});
+    });
+    for my $group (keys %$groups) {
+        for my $host (@{$groups->{$group}}) {
+            next unless ($host);
+            $pm->start and next;
+            my $log = tee_merged {
+                App::Pawn::Rule::commands($group, $host);
+                
+            };
+            $self->log($now, $group, $host, $log);
+            $pm->finish;
         }
     }
+    $pm->wait_all_children;
+    $self->log($now, '_final', 'localhost', tee_merged {
+        App::Pawn::Rule::commands('_final', 'localhost', @{$self->{argv}});
+    });
 }
 
-sub ssh {
+sub sh {
     my $self = shift;
-    my ( $host, $do, $check ) = @_;
-    my $fd;
-    $do =~ s/AST/\\\*/g;
-    open $fd, '-|', "ssh -t $host $do 2> /dev/null";
-    my $output;
-    {
-        local $/ = undef;
-        $output = <$fd>;
-    }
-    $check->($output);
-    close $fd;
+    my @com = ('sh', '-c', join(' ', @_));
+    say 'sh:' . join(' ', @com) if $self->{verbose};
+    return system(@com);
+}
+
+sub sh_result {
+    my $self = shift;
+    my @com = ('sh', '-c', shift);
+    say 'sh:' . join(' ', @com) if $self->{verbose};
+    open my $fd, '-|', @com or die $!;
+    my $out = <$fd>;
+    close($fd);
+    say 'result:' . $out if $self->{verbose};
+    return $out;
+}
+
+sub local_exec {
+    my $self = shift;
+    my @com = split /\s+/, shift;
+    say 'local:' . join(' ', @com) if $self->{verbose};
+    return system(@com);
+}
+
+sub local_exec_result {
+    my $self = shift;
+    my @com = split /\s+/, shift;
+    say 'local:' . join(' ', @com) if $self->{verbose};
+    open my $fd, '-|', @com or die $!;
+    my $out = <$fd>;
+    close($fd);
+    say 'result:' . $out if $self->{verbose};
+    return $out;
+}
+
+sub remote_exec {
+    my $self = shift;
+    my $host = shift;
+    my $ssh = Net::OpenSSH->new($host, strict_mode => 0);
+    $ssh->error and die "Couldn't establish SSH connection: ". $ssh->error;
+    my @com = split /\s+/, shift;
+    say 'remote:' . join(' ', @com) if $self->{verbose};
+    return $ssh->test(@com);
+}
+
+sub remote_exec_result {
+    my $self = shift;
+    my $host = shift;
+    my $ssh = Net::OpenSSH->new($host, strict_mode => 0);
+    $ssh->error and die "Couldn't establish SSH connection: ". $ssh->error;
+    my @com = split /\s+/, shift;
+    say 'remote:' . join(' ', @com) if $self->{verbose};
+    my $out = $ssh->capture(@com);
+    say 'result:' . $out if $self->{verbose};
+    return $out;
 }
 
 sub scp {
     my $self = shift;
-    my ( $host, $opt, $check ) = @_;
-    $opt =~ s/HOST/$host/g;
-    $opt =~ s/AST/\\\*/g;
-    my @com = split /\s+/, $opt;
-    unshift @com, 'scp', '-q';
-    $check->( system(@com) );
+    my $host = shift;
+    my @com = split /\s+/, shift;
+    unshift @com, ('scp');
+    say 'scp:' . join(' ', @com) if $self->{verbose};
+    return system(@com);
 }
 
 sub rsync {
     my $self = shift;
-    my ( $host, $opt, $check ) = @_;
-    $opt =~ s/HOST/$host/g;
-    $opt =~ s/AST/\\\*/g;
-    my @com = split /\s+/, $opt;
-    unshift @com, 'rsync', '-q';
-    $check->( system(@com) );
-}
-
-sub onlocal {
-    my $self = shift;
-    my ( $opt, $check ) = @_;
-    $opt =~ s/AST/\\\*/g;
-    my @com = ('sh', '-c', $opt);
-    $check->( system(@com) );
+    my $host = shift;
+    my @com = split /\s+/, shift;
+    unshift @com, ('rsync');
+    say 'rsync:' . join(' ', @com) if $self->{verbose};
+    return system(@com);
 }
 
 sub doit {
