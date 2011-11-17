@@ -74,6 +74,7 @@ sub hosts {
             push @{$config->{hosts}->{$g}}, $host;
         }
     }
+    1;
 }
 
 sub commands {
@@ -85,6 +86,7 @@ sub commands {
         $config->{host} = $c;
         return $config->{commands}->{$g}->($config->{host}, @_);
     }
+    1;
 }
 
 sub include {
