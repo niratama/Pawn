@@ -6,6 +6,7 @@ use Term::ReadLine;
 use strict;
 
 use Net::OpenSSH;
+use Net::OpenSSH::Constants qw(:error);
 use Capture::Tiny qw(tee_merged);
 use Time::Piece;
 use Parallel::ForkManager;
@@ -124,15 +125,9 @@ sub shell {
             next if defined($g) && ($group ne $g);
             for my $host (@{$groups->{$group}}) {
                 next unless ($host);
-                my $fd;
-                open $fd, '-|', "ssh -t $host $line 2> /dev/null";
-                my $output;
-                {
-                    local $/ = undef;
-                    $output = <$fd>;
-                }
-                chomp($output);
-                close $fd;
+                my $ssh = Net::OpenSSH->new($host, strict_mode => 0);
+                $ssh->error and die "Couldn't establish SSH connection: ". $ssh->error;
+                my $output = $ssh->capture({ tty => 1 }, $line);
                 printf $out "%s> %s\n", $host, $output;
             }
         }
@@ -181,20 +176,28 @@ sub exec {
     });
 }
 
+sub local_capture {
+  my $self = shift;
+  open my $fd, '-|', @_ or die $!;
+  my $out = join('', $fd->getlines);
+  close($fd);
+  return $out;
+}
+
 sub sh {
     my $self = shift;
     my @com = ('sh', '-c', join(' ', @_));
     say 'sh:' . join(' ', @com) if $self->{verbose};
-    return system(@com);
+    my $exitcode = system(@com);
+    say 'result:' . $exitcode if $self->{verbose};
+    return $exitcode;
 }
 
 sub sh_result {
     my $self = shift;
     my @com = ('sh', '-c', shift);
     say 'sh:' . join(' ', @com) if $self->{verbose};
-    open my $fd, '-|', @com or die $!;
-    my $out = <$fd>;
-    close($fd);
+    my $out = $self->local_capture(@com);
     say 'result:' . $out if $self->{verbose};
     return $out;
 }
@@ -210,9 +213,7 @@ sub local_exec_result {
     my $self = shift;
     my @com = split /\s+/, shift;
     say 'local:' . join(' ', @com) if $self->{verbose};
-    open my $fd, '-|', @com or die $!;
-    my $out = <$fd>;
-    close($fd);
+    my $out = $self->local_capture(@com);
     say 'result:' . $out if $self->{verbose};
     return $out;
 }
@@ -224,7 +225,14 @@ sub remote_exec {
     $ssh->error and die "Couldn't establish SSH connection: ". $ssh->error;
     my @com = split /\s+/, shift;
     say 'remote:' . join(' ', @com) if $self->{verbose};
-    return $ssh->test(@com);
+    $ssh->system(@com);
+    my $error = $ssh->error;
+    my $result;
+    if ((!$error) || ($error == OSSH_SLAVE_CMD_FAILED)) {
+      $result = $?;
+    }
+    say 'result:' . $result if $self->{verbose};
+    return $result;
 }
 
 sub remote_exec_result {
